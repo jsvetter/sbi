@@ -39,6 +39,7 @@ from sbi.inference.posteriors.importance_posterior import ImportanceSamplingPost
 from sbi.inference.posteriors.mcmc_posterior import MCMCPosterior
 from sbi.inference.posteriors.posterior_parameters import (
     DirectPosteriorParameters,
+    FilteredDirectPosteriorParameters,
     ImportanceSamplingPosteriorParameters,
     MCMCPosteriorParameters,
     PosteriorParameters,
@@ -67,9 +68,13 @@ from sbi.utils import (
     validate_theta_and_x,
     warn_if_invalid_for_zscoring,
 )
-from sbi.utils.sbiutils import get_simulations_since_round
+from sbi.utils.sbiutils import ImproperEmpirical, get_simulations_since_round
 from sbi.utils.simulation_utils import simulate_for_sbi
-from sbi.utils.torchutils import check_if_prior_on_device, process_device
+from sbi.utils.torchutils import (
+    check_if_prior_on_device,
+    infer_module_device,
+    process_device,
+)
 from sbi.utils.tracking import TensorBoardTracker
 from sbi.utils.user_input_checks import (
     check_sbi_inputs,
@@ -476,7 +481,13 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
         estimator: Optional[ConditionalEstimator],
         prior: Optional[Distribution],
         sample_with: Literal[
-            "mcmc", "rejection", "vi", "importance", "direct", "sde", "ode"
+            "mcmc",
+            "rejection",
+            "vi",
+            "importance",
+            "direct",
+            "sde",
+            "ode",
         ],
         posterior_parameters: Optional[PosteriorParameters],
         **kwargs,
@@ -508,7 +519,7 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
             NeuralPosterior object.
         """
 
-        prior = self._resolve_prior(prior)
+        prior = self._resolve_prior(prior, sample_with)
         estimator, device = self._resolve_estimator(estimator)
         estimator = deepcopy(estimator)
 
@@ -526,7 +537,13 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
 
         return self._posterior
 
-    def _resolve_prior(self, prior: Optional[Distribution]) -> Distribution:
+    def _resolve_prior(
+        self,
+        prior: Optional[Distribution],
+        sample_with: Literal[
+            "mcmc", "rejection", "vi", "importance", "direct", "sde", "ode"
+        ],
+    ) -> Distribution:
         """
         Resolves the prior distribution to use.
 
@@ -542,12 +559,16 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
         """
 
         if prior is None:
-            if self._prior is None:
+            if self._prior is None or (
+                isinstance(self._prior, ImproperEmpirical)
+                and sample_with not in {'direct', 'sde', 'ode'}
+            ):
                 cls_name = self.__class__.__name__
                 raise ValueError(
                     f"""You did not pass a prior. You have to pass the prior either at
                     initialization `inference = {cls_name}(prior)` or to `
-                    .build_posterior (prior=prior)`."""
+                    .build_posterior (prior=prior)` for
+                    sample_with not in {'direct', 'sde', 'ode'}."""
                 )
             prior = self._prior
         else:
@@ -586,14 +607,21 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
                     f" got {type(estimator).__name__}",
                 )
             # Otherwise, infer it from the device of the net parameters.
-            device = str(next(estimator.parameters()).device)
+            device = infer_module_device(estimator, "cpu")
 
         return estimator, device
 
     def _resolve_posterior_parameters(
         self,
         sample_with: Literal[
-            "mcmc", "rejection", "vi", "importance", "direct", "sde", "ode"
+            "mcmc",
+            "rejection",
+            "vi",
+            "importance",
+            "direct",
+            "sde",
+            "ode",
+            "filtered_direct",
         ],
         posterior_parameters: Optional[PosteriorParameters],
         **kwargs,
@@ -640,7 +668,14 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
     def _build_posterior_parameters(
         self,
         sample_with: Literal[
-            "mcmc", "rejection", "vi", "importance", "direct", "sde", "ode"
+            "mcmc",
+            "rejection",
+            "vi",
+            "importance",
+            "direct",
+            "sde",
+            "ode",
+            "filtered_direct",
         ],
         **kwargs,
     ) -> PosteriorParameters:
@@ -659,6 +694,9 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
         if sample_with == "direct":
             params = kwargs.get("direct_sampling_parameters", {}) or {}
             posterior_parameters = DirectPosteriorParameters(**params)
+        elif sample_with == "filtered_direct":
+            params = kwargs.get("filtered_direct_sampling_parameters", {}) or {}
+            posterior_parameters = FilteredDirectPosteriorParameters(**params)
         elif sample_with == "mcmc":
             params = kwargs.get("mcmc_parameters", {}) or {}
             posterior_parameters = MCMCPosteriorParameters(
@@ -701,6 +739,7 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
 
         deprecated_params = {
             "direct_sampling_parameters",
+            "filtered_direct_sampling_parameters",
             "mcmc_parameters",
             "vectorfield_sampling_parameters",
             "rejection_sampling_parameters",
@@ -817,7 +856,13 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
         estimator: ConditionalEstimator,
         prior: Distribution,
         sample_with: Literal[
-            "mcmc", "rejection", "vi", "importance", "direct", "sde", "ode"
+            "mcmc",
+            "rejection",
+            "vi",
+            "importance",
+            "direct",
+            "sde",
+            "ode",
         ],
         device: Union[str, torch.device],
         posterior_parameters: PosteriorParameters,
@@ -900,6 +945,7 @@ class NeuralInference(ABC, Generic[ConditionalEstimatorType]):
             elif isinstance(posterior_parameters, RejectionPosteriorParameters):
                 posterior = RejectionPosterior(
                     potential_fn=potential_fn,
+                    theta_transform=theta_transform,
                     proposal=prior,
                     device=device,
                     **asdict(posterior_parameters),
